@@ -19,9 +19,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pkg/errors"
-
 	"github.com/olivere/elastic/v7/config"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -150,6 +149,7 @@ type Client struct {
 	requiredPlugins           []string        // list of required plugins
 	retrier                   Retrier         // strategy for retries
 	retryStatusCodes          []int           // HTTP status codes where to retry automatically (with retrier)
+	retryOnBrokenResponses    bool            // retry successful requests that errored while parsing the response
 	headers                   http.Header     // a list of default headers to add to each request
 }
 
@@ -164,9 +164,9 @@ type Client struct {
 //
 // Example:
 //
-//   client, err := elastic.NewClient(
-//     elastic.SetURL("http://127.0.0.1:9200", "http://127.0.0.1:9201"),
-//     elastic.SetBasicAuth("user", "secret"))
+//	client, err := elastic.NewClient(
+//	  elastic.SetURL("http://127.0.0.1:9200", "http://127.0.0.1:9201"),
+//	  elastic.SetBasicAuth("user", "secret"))
 //
 // If no URL is configured, Elastic uses DefaultURL by default.
 //
@@ -740,6 +740,17 @@ func SetRetrier(retrier Retrier) ClientOptionFunc {
 func SetRetryStatusCodes(statusCodes ...int) ClientOptionFunc {
 	return func(c *Client) error {
 		c.retryStatusCodes = statusCodes
+		return nil
+	}
+}
+
+// SetRetryOnBrokenResponses retries successful requests that errored while parsing the response.
+// Notice that retries call the specified retrier,
+// so calling SetRetryStatusCodes without setting a Retrier won't do anything
+// for retries.
+func SetRetryOnBrokenResponses(retry bool) ClientOptionFunc {
+	return func(c *Client) error {
+		c.retryOnBrokenResponses = retry
 		return nil
 	}
 }
@@ -1493,7 +1504,24 @@ func (c *Client) PerformRequest(ctx context.Context, opt PerformRequestOptions) 
 
 		resp, err = c.newResponse(res, opt.MaxResponseSize, opt.Stream)
 		if err != nil {
-			return nil, err
+			if !c.retryOnBrokenResponses {
+				return nil, err
+			}
+			n++
+			wait, ok, rerr := retrier.Retry(ctx, n, (*http.Request)(req), res, err)
+			if rerr != nil {
+				c.errorf("elastic: %s retrier returned an error", conn.URL())
+				conn.MarkAsDead()
+				return nil, rerr
+			}
+			if !ok {
+				c.errorf("elastic: %s returned a bad response", conn.URL())
+				conn.MarkAsDead()
+				return nil, err
+			}
+			retried = true
+			time.Sleep(wait)
+			continue // try again
 		}
 
 		break

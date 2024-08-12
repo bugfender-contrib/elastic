@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -24,7 +25,6 @@ import (
 	"time"
 
 	"github.com/fortytw2/leaktest"
-
 	"github.com/olivere/elastic/v7/config"
 )
 
@@ -1476,6 +1476,62 @@ func TestPerformRequestRetryOnHttpError(t *testing.T) {
 	// Connection should be marked as dead after it failed
 	if numFailedReqs != 5 {
 		t.Errorf("expected %d failed requests; got: %d", 5, numFailedReqs)
+	}
+}
+
+// readErrorer throws an error when Read is called
+type readErrorer struct{}
+
+// Read throws an error
+func (*readErrorer) Read(p []byte) (n int, err error) {
+	return 0, errors.New("read error")
+}
+
+func TestPerformRequestRetryOnBodyReadError(t *testing.T) {
+	var numReads int
+	fail := func(r *http.Request) (*http.Response, error) {
+		var body io.ReadCloser
+		if numReads == 0 { // first time it fails, then succeeds
+			body = io.NopCloser(new(readErrorer))
+		} else {
+			body = io.NopCloser(bytes.NewBuffer([]byte(`{"success": "OK"}`)))
+		}
+		numReads += 1
+		return &http.Response{Request: r, StatusCode: http.StatusOK, Body: body}, nil
+	}
+
+	// Run against a failing endpoint and see if PerformRequest
+	// retries correctly.
+	tr := &failingTransport{path: "/fail", fail: fail}
+	httpClient := &http.Client{Transport: tr}
+
+	client, err := NewClient(SetHttpClient(httpClient), SetMaxRetries(5), SetHealthcheck(false), SetRetryOnBrokenResponses(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := client.PerformRequest(context.TODO(), PerformRequestOptions{
+		Method: "GET",
+		Path:   "/fail",
+	})
+	if err != nil {
+		t.Fatalf("expected no error; got: %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected body, got none")
+	}
+	var b struct {
+		Success string `json:"success"`
+	}
+	err = json.Unmarshal(res.Body, &b)
+	if err != nil {
+		t.Fatalf("expected no error unmarshalling; got: %v", err)
+	}
+	if b.Success != "OK" {
+		t.Fatalf("expected success=OK; got: %v", b.Success)
+	}
+	if numReads != 2 {
+		t.Fatalf("expected numReads=2; got: %d", numReads)
 	}
 }
 
